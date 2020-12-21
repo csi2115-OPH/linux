@@ -161,6 +161,214 @@ static void part_in_flight_rw(struct block_device *part,
 		inflight[1] = 0;
 }
 
+struct block_device *__disk_get_part(struct gendisk *disk, int partno)
+{
+	struct disk_part_tbl *ptbl = rcu_dereference(disk->part_tbl);
+
+	if (unlikely(partno < 0 || partno >= ptbl->len))
+		return NULL;
+	return rcu_dereference(ptbl->part[partno]);
+}
+
+/**
+ * disk_part_iter_init - initialize partition iterator
+ * @piter: iterator to initialize
+ * @disk: disk to iterate over
+ * @flags: DISK_PITER_* flags
+ *
+ * Initialize @piter so that it iterates over partitions of @disk.
+ *
+ * CONTEXT:
+ * Don't care.
+ */
+void disk_part_iter_init(struct disk_part_iter *piter, struct gendisk *disk,
+			  unsigned int flags)
+{
+	struct disk_part_tbl *ptbl;
+
+	rcu_read_lock();
+	ptbl = rcu_dereference(disk->part_tbl);
+
+	piter->disk = disk;
+	piter->part = NULL;
+
+	if (flags & DISK_PITER_REVERSE)
+		piter->idx = ptbl->len - 1;
+	else if (flags & (DISK_PITER_INCL_PART0 | DISK_PITER_INCL_EMPTY_PART0))
+		piter->idx = 0;
+	else
+		piter->idx = 1;
+
+	piter->flags = flags;
+
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(disk_part_iter_init);
+
+/**
+ * disk_part_iter_next - proceed iterator to the next partition and return it
+ * @piter: iterator of interest
+ *
+ * Proceed @piter to the next partition and return it.
+ *
+ * CONTEXT:
+ * Don't care.
+ */
+struct block_device *disk_part_iter_next(struct disk_part_iter *piter)
+{
+	struct disk_part_tbl *ptbl;
+	int inc, end;
+
+	/* put the last partition */
+	disk_part_iter_exit(piter);
+
+	/* get part_tbl */
+	rcu_read_lock();
+	ptbl = rcu_dereference(piter->disk->part_tbl);
+
+	/* determine iteration parameters */
+	if (piter->flags & DISK_PITER_REVERSE) {
+		inc = -1;
+		if (piter->flags & (DISK_PITER_INCL_PART0 |
+				    DISK_PITER_INCL_EMPTY_PART0))
+			end = -1;
+		else
+			end = 0;
+	} else {
+		inc = 1;
+		end = ptbl->len;
+	}
+
+	/* iterate to the next partition */
+	for (; piter->idx != end; piter->idx += inc) {
+		struct block_device *part;
+
+		part = rcu_dereference(ptbl->part[piter->idx]);
+		if (!part)
+			continue;
+		piter->part = bdgrab(part);
+		if (!piter->part)
+			continue;
+		if (!bdev_nr_sectors(part) &&
+		    !(piter->flags & DISK_PITER_INCL_EMPTY) &&
+		    !(piter->flags & DISK_PITER_INCL_EMPTY_PART0 &&
+		      piter->idx == 0)) {
+			bdput(piter->part);
+			piter->part = NULL;
+			continue;
+		}
+
+		piter->idx += inc;
+		break;
+	}
+
+	rcu_read_unlock();
+
+	return piter->part;
+}
+EXPORT_SYMBOL_GPL(disk_part_iter_next);
+
+/**
+ * disk_part_iter_exit - finish up partition iteration
+ * @piter: iter of interest
+ *
+ * Called when iteration is over.  Cleans up @piter.
+ *
+ * CONTEXT:
+ * Don't care.
+ */
+void disk_part_iter_exit(struct disk_part_iter *piter)
+{
+	if (piter->part)
+		bdput(piter->part);
+	piter->part = NULL;
+}
+EXPORT_SYMBOL_GPL(disk_part_iter_exit);
+
+static inline int sector_in_part(struct block_device *part, sector_t sector)
+{
+	return part->bd_start_sect <= sector &&
+		sector < part->bd_start_sect + bdev_nr_sectors(part);
+}
+
+/**
+ * disk_map_sector_rcu - map sector to partition
+ * @disk: gendisk of interest
+ * @sector: sector to map
+ *
+ * Find out which partition @sector maps to on @disk.  This is
+ * primarily used for stats accounting.
+ *
+ * CONTEXT:
+ * RCU read locked.
+ *
+ * RETURNS:
+ * Found partition on success, part0 is returned if no partition matches
+ * or the matched partition is being deleted.
+ */
+struct block_device *disk_map_sector_rcu(struct gendisk *disk, sector_t sector)
+{
+	struct disk_part_tbl *ptbl;
+	struct block_device *part;
+	int i;
+
+	rcu_read_lock();
+	ptbl = rcu_dereference(disk->part_tbl);
+
+	part = rcu_dereference(ptbl->last_lookup);
+	if (part && sector_in_part(part, sector))
+		goto out_unlock;
+
+	for (i = 1; i < ptbl->len; i++) {
+		part = rcu_dereference(ptbl->part[i]);
+		if (part && sector_in_part(part, sector)) {
+			rcu_assign_pointer(ptbl->last_lookup, part);
+			goto out_unlock;
+		}
+	}
+
+	part = disk->part0;
+out_unlock:
+	rcu_read_unlock();
+	return part;
+}
+
+/**
+ * disk_has_partitions
+ * @disk: gendisk of interest
+ *
+ * Walk through the partition table and check if valid partition exists.
+ *
+ * CONTEXT:
+ * Don't care.
+ *
+ * RETURNS:
+ * True if the gendisk has at least one valid non-zero size partition.
+ * Otherwise false.
+ */
+bool disk_has_partitions(struct gendisk *disk)
+{
+	struct disk_part_tbl *ptbl;
+	int i;
+	bool ret = false;
+
+	rcu_read_lock();
+	ptbl = rcu_dereference(disk->part_tbl);
+
+	/* Iterate partitions skipping the whole device at index 0 */
+	for (i = 1; i < ptbl->len; i++) {
+		if (rcu_dereference(ptbl->part[i])) {
+			ret = true;
+			break;
+		}
+	}
+
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(disk_has_partitions);
+
 /*
  * Can be deleted altogether. Later.
  *
