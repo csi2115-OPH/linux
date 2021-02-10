@@ -8960,7 +8960,96 @@ static void io_uring_try_cancel_requests(struct io_ring_ctx *ctx,
 	}
 }
 
-static int __io_uring_add_task_file(struct io_ring_ctx *ctx)
+static int io_uring_count_inflight(struct io_ring_ctx *ctx,
+				   struct task_struct *task,
+				   struct files_struct *files)
+{
+	struct io_kiocb *req;
+	int cnt = 0;
+
+	spin_lock_irq(&ctx->inflight_lock);
+	list_for_each_entry(req, &ctx->inflight_list, inflight_entry)
+		cnt += io_match_task(req, task, files);
+	spin_unlock_irq(&ctx->inflight_lock);
+	return cnt;
+}
+
+static void io_uring_cancel_files(struct io_ring_ctx *ctx,
+				  struct task_struct *task,
+				  struct files_struct *files)
+{
+	while (!list_empty_careful(&ctx->inflight_list)) {
+		DEFINE_WAIT(wait);
+		int inflight;
+
+		inflight = io_uring_count_inflight(ctx, task, files);
+		if (!inflight)
+			break;
+
+		io_uring_try_cancel_requests(ctx, task, files);
+
+		if (ctx->sq_data)
+			io_sq_thread_unpark(ctx->sq_data);
+		prepare_to_wait(&task->io_uring->wait, &wait,
+				TASK_UNINTERRUPTIBLE);
+		if (inflight == io_uring_count_inflight(ctx, task, files))
+			schedule();
+		finish_wait(&task->io_uring->wait, &wait);
+		if (ctx->sq_data)
+			io_sq_thread_park(ctx->sq_data);
+	}
+}
+
+static void io_disable_sqo_submit(struct io_ring_ctx *ctx)
+{
+	mutex_lock(&ctx->uring_lock);
+	ctx->sqo_dead = 1;
+	mutex_unlock(&ctx->uring_lock);
+
+	/* make sure callers enter the ring to get error */
+	if (ctx->rings)
+		io_ring_set_wakeup_flag(ctx);
+}
+
+/*
+ * We need to iteratively cancel requests, in case a request has dependent
+ * hard links. These persist even for failure of cancelations, hence keep
+ * looping until none are found.
+ */
+static void io_uring_cancel_task_requests(struct io_ring_ctx *ctx,
+					  struct files_struct *files)
+{
+	struct task_struct *task = current;
+
+	if ((ctx->flags & IORING_SETUP_SQPOLL) && ctx->sq_data) {
+		io_disable_sqo_submit(ctx);
+		task = ctx->sq_data->thread;
+		atomic_inc(&task->io_uring->in_idle);
+		io_sq_thread_park(ctx->sq_data);
+	}
+
+	io_cancel_defer_files(ctx, task, files);
+
+	io_uring_cancel_files(ctx, task, files);
+	if (!files)
+		io_uring_try_cancel_requests(ctx, task, NULL);
+
+	if ((ctx->flags & IORING_SETUP_SQPOLL) && ctx->sq_data) {
+		atomic_dec(&task->io_uring->in_idle);
+		/*
+		 * If the files that are going away are the ones in the thread
+		 * identity, clear them out.
+		 */
+		if (task->io_uring->identity->files == files)
+			task->io_uring->identity->files = NULL;
+		io_sq_thread_unpark(ctx->sq_data);
+	}
+}
+
+/*
+ * Note that this task has used io_uring. We use it for cancelation purposes.
+ */
+static int io_uring_add_task_file(struct io_ring_ctx *ctx, struct file *file)
 {
 	struct io_uring_task *tctx = current->io_uring;
 	struct io_tctx_node *node;
